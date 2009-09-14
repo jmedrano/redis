@@ -58,6 +58,9 @@
 #include <sys/resource.h>
 #include <limits.h>
 
+#include <sys/time.h>
+#include <event.h>
+
 #include "redis.h"
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
@@ -197,6 +200,10 @@ typedef struct redisDb {
  * Clients are taken in a liked list. */
 typedef struct redisClient {
     int fd;
+    struct event_base *eventLoop; /* Now it's a copy of the server one, but it could be different */
+    struct event readEvent;
+    struct event writeEvent;
+    struct event bulkWriteEvent;
     redisDb *db;
     int dictid;
     sds querybuf;
@@ -231,7 +238,10 @@ struct redisServer {
     list *clients;
     list *slaves, *monitors;
     char neterr[ANET_ERR_LEN];
-    aeEventLoop *el;
+    struct event_base *eventLoop;
+    struct event acceptEvent;
+    struct event cron;
+    struct timeval cron_tv;
     int cronloops;              /* number of times the cron function run */
     list *objfreelist;          /* A list of freed objects to avoid malloc() */
     time_t lastsave;            /* Unix time of last save succeeede */
@@ -721,10 +731,10 @@ static void tryResizeHashTables(void) {
     }
 }
 
-static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+static void serverCron(int fd, short event, void *clientData) {
     int j, loops = server.cronloops++;
-    REDIS_NOTUSED(eventLoop);
-    REDIS_NOTUSED(id);
+    REDIS_NOTUSED(fd);
+    REDIS_NOTUSED(event);
     REDIS_NOTUSED(clientData);
 
     /* Update the global state with the amount of used memory */
@@ -834,7 +844,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
             redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync succeeded");
         }
     }
-    return 1000;
+    evtimer_add(&server.cron, &server.cron_tv);
 }
 
 static void createSharedObjects(void) {
@@ -918,7 +928,7 @@ static void initServerConfig() {
     server.replstate = REDIS_REPL_NONE;
 }
 
-static void initServer() {
+static void initServer(struct event_base *eventLoop) {
     int j;
 
     signal(SIGHUP, SIG_IGN);
@@ -930,10 +940,10 @@ static void initServer() {
     server.monitors = listCreate();
     server.objfreelist = listCreate();
     createSharedObjects();
-    server.el = aeCreateEventLoop();
+    server.eventLoop = eventLoop;
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
     server.sharingpool = dictCreate(&setDictType,NULL);
-    if (!server.db || !server.clients || !server.slaves || !server.monitors || !server.el || !server.objfreelist)
+    if (!server.db || !server.clients || !server.slaves || !server.monitors || !server.eventLoop || !server.objfreelist)
         oom("server initialization"); /* Fatal OOM */
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
     if (server.fd == -1) {
@@ -954,7 +964,11 @@ static void initServer() {
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_starttime = time(NULL);
-    aeCreateTimeEvent(server.el, 1000, serverCron, NULL, NULL);
+    event_base_set(server.eventLoop, &server.cron);
+    evtimer_set(&server.cron, serverCron, NULL);
+    server.cron_tv.tv_sec = 1;
+    server.cron_tv.tv_usec = 0;
+    evtimer_add(&server.cron, &server.cron_tv);
 }
 
 /* Empty the whole database */
@@ -1130,8 +1144,8 @@ static void freeClientArgv(redisClient *c) {
 static void freeClient(redisClient *c) {
     listNode *ln;
 
-    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
-    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+    event_del(&c->readEvent);
+    event_del(&c->writeEvent);
     sdsfree(c->querybuf);
     listRelease(c->reply);
     freeClientArgv(c);
@@ -1185,12 +1199,11 @@ static void glueReplyBuffersIfNeeded(redisClient *c) {
     }
 }
 
-static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+static void sendReplyToClient(int fd, short event, void *privdata) {
     redisClient *c = privdata;
     int nwritten = 0, totwritten = 0, objlen;
     robj *o;
-    REDIS_NOTUSED(el);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
 
     if (server.glueoutputbuf && listLength(c->reply) > 1)
         glueReplyBuffersIfNeeded(c);
@@ -1237,7 +1250,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
     if (totwritten > 0) c->lastinteraction = time(NULL);
     if (listLength(c->reply) == 0) {
         c->sentlen = 0;
-        aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+        event_del(&c->writeEvent);
     }
 }
 
@@ -1413,12 +1426,11 @@ static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int di
     if (outv != static_outv) zfree(outv);
 }
 
-static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+static void readQueryFromClient(int fd, short event, void *privdata) {
     redisClient *c = (redisClient*) privdata;
     char buf[REDIS_IOBUF_LEN];
     int nread;
-    REDIS_NOTUSED(el);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
 
     nread = read(fd, buf, REDIS_IOBUF_LEN);
     if (nread == -1) {
@@ -1525,6 +1537,8 @@ static void *dupClientReplyValue(void *o) {
     return 0;
 }
 
+static void sendBulkToSlave(int fd, short event, void *privdata);
+
 static redisClient *createClient(int fd) {
     redisClient *c = zmalloc(sizeof(*c));
 
@@ -1533,6 +1547,7 @@ static redisClient *createClient(int fd) {
     if (!c) return NULL;
     selectDb(c,0);
     c->fd = fd;
+    c->eventLoop = server.eventLoop;
     c->querybuf = sdsempty();
     c->argc = 0;
     c->argv = NULL;
@@ -1545,11 +1560,11 @@ static redisClient *createClient(int fd) {
     if ((c->reply = listCreate()) == NULL) oom("listCreate");
     listSetFreeMethod(c->reply,decrRefCount);
     listSetDupMethod(c->reply,dupClientReplyValue);
-    if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
-        readQueryFromClient, c, NULL) == AE_ERR) {
-        freeClient(c);
-        return NULL;
-    }
+    event_base_set(c->eventLoop, &c->readEvent);
+    event_set(&c->readEvent, c->fd, EV_READ|EV_PERSIST, readQueryFromClient, c);
+    event_add(&c->readEvent, NULL);
+    event_set(&c->writeEvent, c->fd, EV_WRITE|EV_PERSIST, sendReplyToClient, c);
+    event_set(&c->bulkWriteEvent, c->fd, EV_WRITE|EV_PERSIST, sendBulkToSlave, c);
     if (!listAddNodeTail(server.clients,c)) oom("listAddNodeTail");
     return c;
 }
@@ -1558,8 +1573,7 @@ static void addReply(redisClient *c, robj *obj) {
     if (listLength(c->reply) == 0 &&
         (c->replstate == REDIS_REPL_NONE ||
          c->replstate == REDIS_REPL_ONLINE) &&
-        aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
-        sendReplyToClient, c, NULL) == AE_ERR) return;
+        event_add(&c->writeEvent, NULL) != 0) return;
     if (!listAddNodeTail(c->reply,obj)) oom("listAddNodeTail");
     incrRefCount(obj);
 }
@@ -1570,12 +1584,11 @@ static void addReplySds(redisClient *c, sds s) {
     decrRefCount(o);
 }
 
-static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+static void acceptHandler(int fd, short event, void *privdata) {
     int cport, cfd;
     char cip[128];
     redisClient *c;
-    REDIS_NOTUSED(el);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
     REDIS_NOTUSED(privdata);
 
     cfd = anetAccept(server.neterr, fd, cip, &cport);
@@ -3905,10 +3918,9 @@ static void syncCommand(redisClient *c) {
     return;
 }
 
-static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
+static void sendBulkToSlave(int fd, short event, void *privdata) {
     redisClient *slave = privdata;
-    REDIS_NOTUSED(el);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
     char buf[REDIS_IOBUF_LEN];
     ssize_t nwritten, buflen;
 
@@ -3947,11 +3959,9 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (slave->repldboff == slave->repldbsize) {
         close(slave->repldbfd);
         slave->repldbfd = -1;
-        aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+        event_del(&slave->bulkWriteEvent);
         slave->replstate = REDIS_REPL_ONLINE;
-        if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
-            sendReplyToClient, slave, NULL) == AE_ERR) {
-            freeClient(slave);
+        if (event_add(&slave->writeEvent, NULL) != 0) {
             return;
         }
         addReplySds(slave,sdsempty());
@@ -3993,8 +4003,8 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
             slave->repldboff = 0;
             slave->repldbsize = buf.st_size;
             slave->replstate = REDIS_REPL_SEND_BULK;
-            aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
-            if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave, NULL) == AE_ERR) {
+            event_del(&slave->writeEvent);
+            if (event_add(&slave->bulkWriteEvent, NULL) != 0) {
                 freeClient(slave);
                 continue;
             }
@@ -4448,6 +4458,7 @@ static void daemonize(void) {
 }
 
 int main(int argc, char **argv) {
+    struct event_base *main_loop;
     initServerConfig();
     if (argc == 2) {
         ResetServerSaveParams();
@@ -4458,7 +4469,8 @@ int main(int argc, char **argv) {
     } else {
         redisLog(REDIS_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
     }
-    initServer();
+    main_loop = event_init();
+    initServer(main_loop);
     if (server.daemonize) daemonize();
     redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION);
 #ifdef __linux__
@@ -4466,10 +4478,11 @@ int main(int argc, char **argv) {
 #endif
     if (rdbLoad(server.dbfilename) == REDIS_OK)
         redisLog(REDIS_NOTICE,"DB loaded from disk");
-    if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
-        acceptHandler, NULL, NULL) == AE_ERR) oom("creating file event");
+    event_base_set(server.eventLoop, &server.acceptEvent);
+    event_set(&server.acceptEvent, server.fd,  EV_READ|EV_PERSIST, acceptHandler, NULL);
+    if (event_add(&server.acceptEvent, NULL) != 0)
+        oom("creating file event");
     redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
-    aeMain(server.el);
-    aeDeleteEventLoop(server.el);
+    event_base_dispatch(main_loop);
     return 0;
 }

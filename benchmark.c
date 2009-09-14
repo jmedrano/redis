@@ -39,7 +39,9 @@
 #include <signal.h>
 #include <assert.h>
 
-#include "ae.h"
+#include <sys/time.h>
+#include <event.h>
+
 #include "anet.h"
 #include "sds.h"
 #include "adlist.h"
@@ -66,7 +68,6 @@ static struct config {
     int datasize;
     int randomkeys;
     int randomkeys_keyspacelen;
-    aeEventLoop *el;
     char *hostip;
     int hostport;
     int keepalive;
@@ -81,6 +82,8 @@ static struct config {
 typedef struct _client {
     int state;
     int fd;
+    struct event readEvent;
+    struct event writeEvent;
     sds obuf;
     sds ibuf;
     int readlen;        /* readlen == -1 means read a single line */
@@ -90,7 +93,7 @@ typedef struct _client {
 } *client;
 
 /* Prototypes */
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void writeHandler(int fd, short event, void *privdata);
 static void createMissingClients(client c);
 
 /* Implementation */
@@ -107,8 +110,8 @@ static long long mstime(void) {
 static void freeClient(client c) {
     listNode *ln;
 
-    aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-    aeDeleteFileEvent(config.el,c->fd,AE_READABLE);
+    event_del(&c->readEvent);
+    event_del(&c->writeEvent);
     sdsfree(c->ibuf);
     sdsfree(c->obuf);
     close(c->fd);
@@ -130,9 +133,10 @@ static void freeAllClients(void) {
 }
 
 static void resetClient(client c) {
-    aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-    aeDeleteFileEvent(config.el,c->fd,AE_READABLE);
-    aeCreateFileEvent(config.el,c->fd, AE_WRITABLE,writeHandler,c,NULL);
+    event_del(&c->readEvent);
+    event_del(&c->writeEvent);
+    event_set(&c->writeEvent, c->fd, EV_WRITE|EV_PERSIST, writeHandler, c);
+    event_add(&c->writeEvent, NULL);
     sdsfree(c->ibuf);
     c->ibuf = sdsempty();
     c->readlen = (c->replytype == REPLY_BULK) ? -1 : 0;
@@ -164,7 +168,7 @@ static void clientDone(client c) {
 
     if (config.donerequests == config.requests) {
         freeClient(c);
-        aeStop(config.el);
+        event_loopexit(NULL);
         return;
     }
     if (config.keepalive) {
@@ -178,14 +182,13 @@ static void clientDone(client c) {
     }
 }
 
-static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask)
+static void readHandler(int fd, short event, void *privdata)
 {
     char buf[1024];
     int nread;
     client c = privdata;
-    REDIS_NOTUSED(el);
     REDIS_NOTUSED(fd);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
 
     nread = read(c->fd, buf, 1024);
     if (nread == -1) {
@@ -227,12 +230,11 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask)
         clientDone(c);
 }
 
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask)
+static void writeHandler(int fd, short event, void *privdata)
 {
     client c = privdata;
-    REDIS_NOTUSED(el);
     REDIS_NOTUSED(fd);
-    REDIS_NOTUSED(mask);
+    REDIS_NOTUSED(event);
 
     if (c->state == CLIENT_CONNECTING) {
         c->state = CLIENT_SENDQUERY;
@@ -249,8 +251,8 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask)
         }
         c->written += nwritten;
         if (sdslen(c->obuf) == c->written) {
-            aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-            aeCreateFileEvent(config.el,c->fd,AE_READABLE,readHandler,c,NULL);
+            event_del(&c->writeEvent);
+            event_add(&c->readEvent, NULL);
             c->state = CLIENT_READREPLY;
         }
     }
@@ -272,7 +274,9 @@ static client createClient(void) {
     c->readlen = 0;
     c->written = 0;
     c->state = CLIENT_CONNECTING;
-    aeCreateFileEvent(config.el, c->fd, AE_WRITABLE, writeHandler, c, NULL);
+    event_set(&c->readEvent, c->fd, EV_READ|EV_PERSIST, readHandler, c);
+    event_set(&c->writeEvent, c->fd, EV_WRITE|EV_PERSIST, writeHandler, c);
+    event_add(&c->writeEvent, NULL);
     config.liveclients++;
     listAddNodeTail(config.clients,c);
     return c;
@@ -403,7 +407,7 @@ int main(int argc, char **argv) {
     config.numclients = 50;
     config.requests = 10000;
     config.liveclients = 0;
-    config.el = aeCreateEventLoop();
+    (void)event_init();
     config.keepalive = 1;
     config.donerequests = 0;
     config.datasize = 3;
@@ -438,7 +442,7 @@ int main(int argc, char **argv) {
         }
         c->replytype = REPLY_RETCODE;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("SET");
 
         prepareForBenchmark();
@@ -448,7 +452,7 @@ int main(int argc, char **argv) {
         c->replytype = REPLY_BULK;
         c->readlen = -1;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("GET");
 
         prepareForBenchmark();
@@ -457,7 +461,7 @@ int main(int argc, char **argv) {
         c->obuf = sdscat(c->obuf,"INCR counter_rand000000000000\r\n");
         c->replytype = REPLY_INT;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("INCR");
 
         prepareForBenchmark();
@@ -466,7 +470,7 @@ int main(int argc, char **argv) {
         c->obuf = sdscat(c->obuf,"LPUSH mylist 3\r\nbar\r\n");
         c->replytype = REPLY_INT;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("LPUSH");
 
         prepareForBenchmark();
@@ -476,7 +480,7 @@ int main(int argc, char **argv) {
         c->replytype = REPLY_BULK;
         c->readlen = -1;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("LPOP");
 
         prepareForBenchmark();
@@ -485,7 +489,7 @@ int main(int argc, char **argv) {
         c->obuf = sdscat(c->obuf,"PING\r\n");
         c->replytype = REPLY_RETCODE;
         createMissingClients(c);
-        aeMain(config.el);
+        event_dispatch();
         endBenchmark("PING");
 
         printf("\n");

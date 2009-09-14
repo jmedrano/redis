@@ -10,6 +10,8 @@ OBJ = adlist.o ae.o anet.o dict.o redis.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort
 BENCHOBJ = ae.o anet.o benchmark.o sds.o adlist.o zmalloc.o
 CLIOBJ = anet.o sds.o adlist.o redis-cli.o zmalloc.o
 
+LIBS = -levent
+
 PRGNAME = redis-server
 BENCHPRGNAME = redis-benchmark
 CLIPRGNAME = redis-cli
@@ -31,7 +33,7 @@ sds.o: sds.c sds.h zmalloc.h
 zmalloc.o: zmalloc.c config.h
 
 redis-server: $(OBJ)
-	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ)
+	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ) ${LIBS}
 	@echo ""
 	@echo "Hint: To run the test-redis.tcl script is a good idea."
 	@echo "Launch the redis server with ./redis-server, then in another"
@@ -39,7 +41,7 @@ redis-server: $(OBJ)
 	@echo ""
 
 redis-benchmark: $(BENCHOBJ)
-	$(CC) -o $(BENCHPRGNAME) $(CCOPT) $(DEBUG) $(BENCHOBJ)
+	$(CC) -o $(BENCHPRGNAME) $(CCOPT) $(DEBUG) $(BENCHOBJ) ${LIBS}
 
 redis-cli: $(CLIOBJ)
 	$(CC) -o $(CLIPRGNAME) $(CCOPT) $(DEBUG) $(CLIOBJ)
